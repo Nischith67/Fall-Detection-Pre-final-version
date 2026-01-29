@@ -1,0 +1,9 @@
+opencv-python
+numpy
+requests
+torch
+torchvision
+ultralytics
+face_recognition
+deep-person-reid
+Flask

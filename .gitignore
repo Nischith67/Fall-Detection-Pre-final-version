@@ -1,0 +1,12 @@
+__pycache__/
+.venv/
+.vscode/
+.zenflow/
+.zencoder/
+.qodo/
+*.db
+*.pickle
+*.log
+registered_faces/
+!yolo11n-pose.pt
+!yolov8n-pose.pt
