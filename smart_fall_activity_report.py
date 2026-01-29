@@ -87,45 +87,64 @@ class ReIDManager:
         features = nn.functional.normalize(features, p=2, dim=1)
         return features.cpu().numpy().flatten()
 
-    def match_identity(self, current_embedding):
+    def match_identity(self, current_embedding, current_sig=None):
         if current_embedding is None: return None
         
         best_id = None
         max_sim = -1
         
         for pid, data in self.identity_bank.items():
-            if 'embeddings' not in data: 
-                # Backward compatibility for old format
-                if 'embedding' in data:
-                    data['embeddings'] = [data['embedding']]
-                else:
-                    continue
-            
-            # Compare current embedding against the BEST match in this person's gallery
-            # This allows matching front view to front view, side to side, etc.
+            # 1. Try ReID Embedding Match
             person_sim = -1
-            for gallery_emb in data['embeddings']:
-                # Dimension check: prevents error if switching from ResNet50 (2048) to OSNet (512)
-                if gallery_emb.shape != current_embedding.shape:
-                    continue
-                sim = np.dot(current_embedding, gallery_emb)
-                if sim > person_sim:
-                    person_sim = sim
+            if 'embedding' in data:
+                # Moving Average format
+                gallery_emb = data['embedding']
+                if gallery_emb.shape == current_embedding.shape:
+                    person_sim = np.dot(current_embedding, gallery_emb)
+            elif 'embeddings' in data and data['embeddings']:
+                # Legacy Gallery format: Find best match
+                for gallery_emb in data['embeddings']:
+                    if gallery_emb.shape == current_embedding.shape:
+                        sim = np.dot(current_embedding, gallery_emb)
+                        if sim > person_sim: person_sim = sim
             
             if person_sim > max_sim:
                 max_sim = person_sim
                 best_id = pid
         
+        # Threshold check for ReID
         if max_sim > self.threshold:
-            # Update last seen
+            # Update Identity Bank with Moving Average (Stability Patch)
+            # Formula: 0.8 * old + 0.2 * new, then re-normalize
+            if 'embedding' not in self.identity_bank[best_id]:
+                # Convert legacy to moving average format
+                self.identity_bank[best_id]['embedding'] = self.identity_bank[best_id]['embeddings'][0]
+            
+            old_emb = self.identity_bank[best_id]['embedding']
+            updated_emb = 0.8 * old_emb + 0.2 * current_embedding
+            # L2 Normalize the updated embedding
+            norm = np.linalg.norm(updated_emb)
+            if norm > 0:
+                self.identity_bank[best_id]['embedding'] = updated_emb / norm
+            
             self.identity_bank[best_id]['last_seen'] = time.time()
             return best_id
         
-        # New identity
+        # 2. Fallback to Clothing Color (Stability Patch)
+        if current_sig is not None:
+            for pid, data in self.identity_bank.items():
+                if 'color_sig' in data:
+                    if compare_signatures(current_sig, data['color_sig']) > 0.6:
+                        # Found a match via color! Update its last seen
+                        self.identity_bank[pid]['last_seen'] = time.time()
+                        return pid
+
+        # 3. New identity
         new_id = f"Person_{self.next_persistent_id}"
         self.next_persistent_id += 1
         self.identity_bank[new_id] = {
-            'embeddings': [current_embedding], # Start gallery
+            'embedding': current_embedding,
+            'color_sig': current_sig,
             'last_seen': time.time(),
             'first_seen': time.time()
         }
@@ -171,7 +190,7 @@ class ReIDManager:
             print(f"🧹 Pruned {len(to_delete)} ghost identities from ReID bank.")
         return to_delete
 
-reid_manager = ReIDManager(threshold=0.65)
+reid_manager = ReIDManager(threshold=0.45)
 tracker_to_persistent = {} # Maps YOLO tracker_id -> persistent_id
 
 # ==================== Face Recognition Setup ====================
@@ -283,10 +302,18 @@ def log_activity_to_db():
         # Snapshot the data while holding lock to minimize contention
         with data_lock:
             stats_snapshot = []
-            for pid in list(all_tracked_people):
-                stats_snapshot.append((str(pid), walking_time.get(pid, 0), standing_time.get(pid, 0),
-                                     sitting_time.get(pid, 0), sleeping_time.get(pid, 0)))
+            if person_state or any(walking_time.values()) or any(standing_time.values()): # Only if there is active data
+                for pid in list(all_tracked_people):
+                    stats_snapshot.append((str(pid), walking_time.get(pid, 0), standing_time.get(pid, 0),
+                                         sitting_time.get(pid, 0), sleeping_time.get(pid, 0)))
         
+        if not stats_snapshot:
+            # Just save the banks and continue if no activity stats to log
+            with data_lock:
+                reid_manager.save_bank()
+                save_manual_id_map()
+            continue
+
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -1386,10 +1413,9 @@ while True:
             prev_gray = gray
             continue
 
-        # Check for idle timeout (Sleep Transition)
-        # BUGFIX: Don't sleep if people are currently being tracked
-        if now - last_motion_time > 12 and not person_state:
-            print("💤 Low Power Mode: No motion detected. Turning off webcam...")
+        # Check for idle timeout (Sleep Transition) - Optimized for 10s inactivity
+        if now - last_motion_time > 10.0 and not person_state:
+            print("💤 Low Power Mode: No motion detected for 10s. Turning off webcam...")
             system_sleeping = True
             cv2.destroyAllWindows()
             if cap: cap.release()
@@ -1426,8 +1452,11 @@ while True:
                     if x2 > x1 and y2 > y1:
                         person_img = frame[y1:y2, x1:x2]
                         embedding = reid_manager.get_embedding(person_img)
+                        # Stability Patch: Fallback to Clothing Color
+                        current_sig = get_color_signature(person_img)
+                        
                         with data_lock:
-                            persistent_id = reid_manager.match_identity(embedding)
+                            persistent_id = reid_manager.match_identity(embedding, current_sig=current_sig)
                         tracker_to_persistent[yolo_id_str] = persistent_id
                         
                         # Initialize movement tracking
@@ -1545,20 +1574,36 @@ while True:
                 # --- 6. Body Scanning (Capture multi-angle signatures) ---
                 # During the first 10 seconds of seeing a person, periodically capture different angles
                 with data_lock:
-                    first_seen = reid_manager.identity_bank.get(persistent_id, {}).get('first_seen', 0)
-                    gallery_len = len(reid_manager.identity_bank.get(persistent_id, {}).get('embeddings', []))
+                    id_data = reid_manager.identity_bank.get(persistent_id, {})
+                    first_seen = id_data.get('first_seen', 0)
+                    gallery_len = len(id_data.get('embeddings', [])) if 'embeddings' in id_data else 1
                 
-                if (now - first_seen) < 10 and frame_count % 15 == 0 and gallery_len < 10:
+                if (now - first_seen) < 15 and frame_count % 15 == 0:
                     box = results[0].boxes.xyxy[i].cpu().numpy().astype(int)
                     x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
                     if x2 > x1 and y2 > y1:
                         person_img = frame[y1:y2, x1:x2]
+                        # Periodically update color signature to handle lighting changes
+                        current_sig = get_color_signature(person_img)
                         emb = reid_manager.get_embedding(person_img)
+                        
                         with data_lock:
-                            reid_manager.add_to_gallery(persistent_id, emb)
+                            if persistent_id in reid_manager.identity_bank:
+                                # Update color signature
+                                reid_manager.identity_bank[persistent_id]['color_sig'] = current_sig
+                                # Update embedding via moving average if already matched
+                                old_emb = reid_manager.identity_bank[persistent_id].get('embedding')
+                                if old_emb is not None:
+                                    updated_emb = 0.9 * old_emb + 0.1 * emb # Slower update during tracking
+                                    norm = np.linalg.norm(updated_emb)
+                                    if norm > 0:
+                                        reid_manager.identity_bank[persistent_id]['embedding'] = updated_emb / norm
+                                else:
+                                    # Fallback for legacy gallery if needed
+                                    reid_manager.add_to_gallery(persistent_id, emb)
                         
                         # Visual feedback for scanning
-                        cv2.putText(display_frame, "Scanning Body...", (x1, y1 - 10),
+                        cv2.putText(display_frame, "Updating Body Signature...", (x1, y1 - 10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
                 with data_lock:
@@ -1713,8 +1758,14 @@ while True:
         # Clean up people not detected for 30 frames (about 1 second at 30fps)
         ids_to_remove = []
         for persistent_id in list(person_state.keys()):
+            # Stability Patch: Don't remove named/important IDs from active tracking state easily
             if persistent_id not in detected_ids and (frame_count - last_detection.get(persistent_id, 0)) > 30:
-                ids_to_remove.append(persistent_id)
+                if persistent_id in manual_id_map:
+                    # Named IDs get a much longer timeout (e.g. 5 minutes) before being cleared from memory
+                    if (frame_count - last_detection.get(persistent_id, 0)) > 9000:
+                         ids_to_remove.append(persistent_id)
+                else:
+                    ids_to_remove.append(persistent_id)
         
         with data_lock:
             for persistent_id in ids_to_remove:
