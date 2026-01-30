@@ -10,7 +10,7 @@ A real-time system for monitoring elderly activity and detecting falls using YOL
 - **Low Power Mode**: Automatically reduces resource usage when no motion is detected.
 
 ## Requirements
-- Python 3.8+
+- Python 3.10 or 3.12
 - Webcam or Video Stream
 - NVIDIA GPU (Optional, but recommended for real-time performance)
 
